@@ -23,8 +23,9 @@ const client = new snap7.S7Client();
 // ============================================================
 function connecterAutomate() {
   try {
+
     if (client.Connected()) {
-      return;
+      return ;
     }
 
     client.ConnectTo(IP_AUTOMATE, RACK, SLOT, (err) => {
@@ -40,45 +41,76 @@ function connecterAutomate() {
     console.error('❌ Exception lors de la connexion à l\'automate :', error.message);
   }
 }
-
-function lireValeurFloat(result) {
-  if (!result || !result.Data || !Buffer.isBuffer(result.Data)) {
+// ============================================================
+// ROUTE GET /api/status : Vérifie si l'automate est connecté
+// Appelée par Angular pour afficher l'état de connexion
+// ============================================================
+app.get('/api/status', (req, res) => {
+  if (client.Connected()) {
+    res.json({ connecte: true });
+  } else {
+    res.json({ connecte: false });
+  }
+});
+// ============================================================
+// FONCTION : Formate une valeur flottante à 2 décimales
+// ============================================================
+function formaterReel(value) {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
     return null;
   }
+  return Number(value.toFixed(2));
+}
 
+// ============================================================
+// FONCTION : Lecture d'une valeur flottante depuis le résultat de lecture
+// ============================================================
+function lireValeurFloat(result) {
+  // Vérification que le résultat est valide et contient des données
+  if (!result || !result.Data || !Buffer.isBuffer(result.Data)) {// Buffer.isBuffer(result.Data) vérifie si result.Data est un Buffer
+    console.error('❌ Résultat de lecture invalide ou vide :', result);
+    return null;
+  }
+// Lecture de la valeur flottante depuis le buffer en utilisant readFloatBE (Big Endian)
   try {
-    return result.Data.readFloatBE(0);
+    const floatValue = result.Data.readFloatBE(0);// Lecture de la valeur flottante à partir du buffer
+    return formaterReel(floatValue);
   } catch (error) {
     console.error('❌ Erreur de lecture du flottant depuis l\'automate :', error.message);
     return null;
   }
 }
 
+// ============================================================
+// FONCTION : Lecture simultanée de plusieurs variables depuis l'automate
+// ============================================================
 function lireVariablesEnBloc(variables, callback) {
-  const fallbackResults = [];
-  let pending = variables.length;
+  const fallbackResults = [];// Tableau pour stocker les résultats de lecture
+  let pending = variables.length;// Compteur pour suivre le nombre de lectures en attente
 
   if (pending === 0) {
-    callback(null, fallbackResults);
+    callback(null, fallbackResults);//Callback immédiat si aucune variable à lire
     return;
   }
-
-  variables.forEach(function(variable, index) {
-    client.ReadArea(
-      variable.Area || client.S7AreaDB,
-      variable.DBNumber || 0,
-      variable.Start,
-      variable.Amount,
-      variable.WordLen || client.S7WLReal,
+// Boucle sur chaque variable pour effectuer la lecture
+  variables.forEach(function(variable, index) { //FUNCTION : Lire une variable spécifique depuis l'automate
+    client.ReadArea(// ReadArea est une fonction de node-snap7 qui lit une zone mémoire spécifique de l'automate
+      variable.Area || client.S7AreaDB,// Zone mémoire à lire (DB, Inputs, Outputs, etc.)
+      variable.DBNumber || 0,// Numéro du bloc de données (DB) à lire
+      variable.Start,// Offset de départ dans le bloc de données
+      variable.Amount,// Nombre d'éléments à lire
+      variable.WordLen || client.S7WLReal,// Type de données à lire (Real, Int, etc.)
+      // Fonction de rappel pour traiter le résultat de la lecture
       function(readErr, data) {
-        fallbackResults[index] = {
-          Result: readErr ? 1 : 0,
-          Data: readErr ? null : data,
+        fallbackResults[index] = {// Stockage du résultat de lecture dans le tableau fallbackResults
+          Result: readErr ? 1 : 0,// 0 = succès, 1 = erreur
+          Data: readErr ? null : data,// Données lues depuis l'automate
+          Error: readErr ? client.ErrorText(readErr) : null,// Message d'erreur si la lecture a échoué
         };
 
-        pending -= 1;
-        if (pending === 0) {
-          callback(null, fallbackResults);
+        pending -= 1;// Décrémentation du compteur de lectures en attente
+        if (pending === 0) {// Si toutes les lectures sont terminées, on appelle le callback avec les résultats
+          callback(null, fallbackResults);// Appel du callback avec les résultats de lecture
         }
       }
     );
@@ -136,10 +168,10 @@ function lireDonneesAutomate() {
         v1:           lireValeurFloat(results[3]),  // Tension phase 1 (V)
         v2:           lireValeurFloat(results[4]),  // Tension phase 2 (V)
         v3:           lireValeurFloat(results[5]),  // Tension phase 3 (V)
-        p1:           lireValeurFloat(results[6]),  // Puissance phase 1 (W)
-        p2:           lireValeurFloat(results[7]),  // Puissance phase 2 (W)
-        p3:           lireValeurFloat(results[8]),  // Puissance phase 3 (W)
-        p_totale:     lireValeurFloat(results[9]),  // Puissance active totale (W)
+        p1:           lireValeurFloat(results[6])*1000,  // Puissance phase 1 (W)
+        p2:           lireValeurFloat(results[7])*1000,  // Puissance phase 2 (W)
+        p3:           lireValeurFloat(results[8])*1000,  // Puissance phase 3 (W)
+        p_totale:     lireValeurFloat(results[9])*1000,  // Puissance active totale (W)
         fc_puissance: lireValeurFloat(results[10]), // Facteur de puissance
       };
 
@@ -182,8 +214,8 @@ function sauvegarderMesuresDansFichier(nouvellesMesures) {
   // Remplacement ou création de la feuille dans le classeur
   if (workbook.SheetNames && workbook.SheetNames.length > 0) {
     // Si une feuille existe déjà → on la remplace
-    const sheetName = workbook.SheetNames[0];
-    workbook.Sheets[sheetName] = worksheet;
+    const sheetName = workbook.SheetNames[0];// Nom de la première feuille existante
+    workbook.Sheets[sheetName] = worksheet; // Remplacement de la feuille existante par la nouvelle feuille 
   } else {
     // Sinon → on crée une nouvelle feuille appelée 'Mesures'
     XLSX.utils.book_append_sheet(workbook, worksheet, 'Mesures');
@@ -213,7 +245,7 @@ app.get('/api/mesures', (req, res) => {
     return res.status(503).json({ message: '⚠️ Automate non connecté' });
   }
 
-  // Lecture des variables en temps réel depuis DB3
+  // Lecture des variables en temps réel depuis DB3d
   const variables = [
     { Area: client.S7AreaDB, WordLen: client.S7WLReal, DBNumber: 3, Start: 0,   Amount: 1 }, // I1
     { Area: client.S7AreaDB, WordLen: client.S7WLReal, DBNumber: 3, Start: 4,   Amount: 1 }, // I2
@@ -242,10 +274,10 @@ app.get('/api/mesures', (req, res) => {
         v1:           lireValeurFloat(results[3]),
         v2:           lireValeurFloat(results[4]),
         v3:           lireValeurFloat(results[5]),
-        p1:           lireValeurFloat(results[6]),
-        p2:           lireValeurFloat(results[7]),
-        p3:           lireValeurFloat(results[8]),
-        p_totale:     lireValeurFloat(results[9]),
+        p1:           lireValeurFloat(results[6])*1000, // Conversion en W
+        p2:           lireValeurFloat(results[7])*1000, // Conversion en W
+        p3:           lireValeurFloat(results[8])*1000, // Conversion en W
+        p_totale:     lireValeurFloat(results[9])*1000, // Conversion en W
         fc_puissance: lireValeurFloat(results[10]),
       });
     });
@@ -274,25 +306,6 @@ app.get('/api/mesures/excel', (req, res) => {
   } catch (error) {
     console.error('❌ Erreur lecture fichier Excel :', error);
     res.status(500).json({ message: 'Erreur lors de la lecture du fichier Excel' });
-  }
-});
-
-// ============================================================
-// ROUTE POST /api/mesures/excel : Sauvegarde manuelle depuis Angular
-// Peut être appelée si tu veux sauvegarder depuis le frontend
-// ============================================================
-app.post('/api/mesures/excel', (req, res) => {
-  try {
-    const donneesRecues = req.body; // Récupération des données du corps de la requête
-    // Vérification si les données sont un tableau, sinon les encapsuler dans un tableau
-    const nouvellesMesures = Array.isArray(donneesRecues) ? donneesRecues : [donneesRecues];
-
-    sauvegarderMesuresDansFichier(nouvellesMesures); // Sauvegarde dans le fichier Excel
-
-    res.json({ message: '✅ Fichier Excel mis à jour avec succès' });
-  } catch (error) {
-    console.error('❌ Erreur mise à jour fichier Excel :', error);
-    res.status(500).json({ message: 'Erreur lors de la mise à jour du fichier Excel' });
   }
 });
 
