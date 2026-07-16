@@ -4,11 +4,50 @@ const XLSX = require('xlsx'); // Importation du module XLSX pour manipuler les f
 const fs = require('fs'); // Importation du module fs pour gérer les fichiers
 const path = require('path'); // Importation du module path pour gérer les chemins de fichiers
 const snap7 = require('node-snap7'); // Importation du module node-snap7 pour communiquer avec les automates Siemens S7
+const http = require('http'); // Pour créer un serveur HTTP autour d'Express (nécessaire pour Socket.IO)
+const { Server } = require('socket.io'); // Pour la communication temps réel avec Angular
+const { initializeApp, cert } = require('firebase-admin/app'); // Firebase Admin (initialisation)
+const { getMessaging } = require('firebase-admin/messaging'); // Firebase Admin (envoi de notifications push)
+
+// Chemin exact vers ta clé de service Firebase (doit être dans le même dossier que server.js)
+const serviceAccount = require('./mesures-electriques-app-firebase-adminsdk-fbsvc-f2b7063962.json');
 
 const app = express(); // Création d'une instance de l'application Express
+const server = http.createServer(app); // Serveur HTTP qui enveloppe Express
+const io = new Server(server, { // Socket.IO attaché au même serveur HTTP
+  cors: {
+    origin: '*', // Autorise Angular (localhost:4200, 10.0.2.2, etc.) à se connecter
+  },
+});
+
+// Initialisation de Firebase Admin — DOIT être fait avant d'utiliser getMessaging()
+initializeApp({
+  credential: cert(serviceAccount),
+});
+
+// ============================================================
+// MIDDLEWARE : Configuration d'Express
+// ⚠️ DOIT ÊTRE PLACÉ ICI, AVANT TOUTES LES ROUTES (app.get / app.post...)
+// ============================================================
+app.use(cors()); // Autorise les requêtes depuis Angular (localhost:4200 ou 10.0.2.2)
+app.use(express.json({ limit: '10mb' })); // Permet de lire le corps des requêtes JSON
 
 // Définition du chemin vers le fichier Excel dans le dossier public du frontend
 const frontendExcelPath = path.join(__dirname, '..', 'my-app', 'public', 'mesures.xlsx');
+
+// ============================================================
+// Stockage des tokens des appareils enregistrés pour les notifications push
+// ============================================================
+let tokensEnregistres = [];
+
+app.post('/api/register-token', (req, res) => {
+  const { token } = req.body;
+  if (token && !tokensEnregistres.includes(token)) {
+    tokensEnregistres.push(token);
+    console.log('✅ Token enregistré pour notifications push :', token);
+  }
+  res.json({ message: 'Token enregistré' });
+});
 
 // ⚙️ Configuration de l'automate Siemens S7-1214C
 const IP_AUTOMATE = '192.168.1.40'; // Adresse IP de l'automate Siemens S7
@@ -23,17 +62,14 @@ const client = new snap7.S7Client();
 // ============================================================
 function connecterAutomate() {
   try {
-
     if (client.Connected()) {
-      return ;
+      return;
     }
 
     client.ConnectTo(IP_AUTOMATE, RACK, SLOT, (err) => {
       if (err) {
-        // Affichage de l'erreur si la connexion échoue
         console.error('❌ Erreur de connexion à l\'automate :', client.ErrorText(err));
       } else {
-        // Confirmation de la connexion réussie
         console.log('✅ Connexion réussie à l\'automate Siemens S7-1214C');
       }
     });
@@ -41,17 +77,18 @@ function connecterAutomate() {
     console.error('❌ Exception lors de la connexion à l\'automate :', error.message);
   }
 }
+
 // ============================================================
 // ROUTE GET /api/status : Vérifie si l'automate est connecté
-// Appelée par Angular pour afficher l'état de connexion
 // ============================================================
-app.get('/api/status', (req, res) => {
+app.get(['/api/status', '/api/statut'], (req, res) => {
   if (client.Connected()) {
     res.json({ connecte: true });
   } else {
     res.json({ connecte: false });
   }
 });
+
 // ============================================================
 // FONCTION : Formate une valeur flottante à 2 décimales
 // ============================================================
@@ -66,14 +103,12 @@ function formaterReel(value) {
 // FONCTION : Lecture d'une valeur flottante depuis le résultat de lecture
 // ============================================================
 function lireValeurFloat(result) {
-  // Vérification que le résultat est valide et contient des données
-  if (!result || !result.Data || !Buffer.isBuffer(result.Data)) {// Buffer.isBuffer(result.Data) vérifie si result.Data est un Buffer
+  if (!result || !result.Data || !Buffer.isBuffer(result.Data)) {
     console.error('❌ Résultat de lecture invalide ou vide :', result);
     return null;
   }
-// Lecture de la valeur flottante depuis le buffer en utilisant readFloatBE (Big Endian)
   try {
-    const floatValue = result.Data.readFloatBE(0);// Lecture de la valeur flottante à partir du buffer
+    const floatValue = result.Data.readFloatBE(0);
     return formaterReel(floatValue);
   } catch (error) {
     console.error('❌ Erreur de lecture du flottant depuis l\'automate :', error.message);
@@ -85,32 +120,31 @@ function lireValeurFloat(result) {
 // FONCTION : Lecture simultanée de plusieurs variables depuis l'automate
 // ============================================================
 function lireVariablesEnBloc(variables, callback) {
-  const fallbackResults = [];// Tableau pour stocker les résultats de lecture
-  let pending = variables.length;// Compteur pour suivre le nombre de lectures en attente
+  const fallbackResults = [];
+  let pending = variables.length;
 
   if (pending === 0) {
-    callback(null, fallbackResults);//Callback immédiat si aucune variable à lire
+    callback(null, fallbackResults);
     return;
   }
-// Boucle sur chaque variable pour effectuer la lecture
-  variables.forEach(function(variable, index) { //FUNCTION : Lire une variable spécifique depuis l'automate
-    client.ReadArea(// ReadArea est une fonction de node-snap7 qui lit une zone mémoire spécifique de l'automate
-      variable.Area || client.S7AreaDB,// Zone mémoire à lire (DB, Inputs, Outputs, etc.)
-      variable.DBNumber || 0,// Numéro du bloc de données (DB) à lire
-      variable.Start,// Offset de départ dans le bloc de données
-      variable.Amount,// Nombre d'éléments à lire
-      variable.WordLen || client.S7WLReal,// Type de données à lire (Real, Int, etc.)
-      // Fonction de rappel pour traiter le résultat de la lecture
-      function(readErr, data) {
-        fallbackResults[index] = {// Stockage du résultat de lecture dans le tableau fallbackResults
-          Result: readErr ? 1 : 0,// 0 = succès, 1 = erreur
-          Data: readErr ? null : data,// Données lues depuis l'automate
-          Error: readErr ? client.ErrorText(readErr) : null,// Message d'erreur si la lecture a échoué
+
+  variables.forEach(function (variable, index) {
+    client.ReadArea(
+      variable.Area || client.S7AreaDB,
+      variable.DBNumber || 0,
+      variable.Start,
+      variable.Amount,
+      variable.WordLen || client.S7WLReal,
+      function (readErr, data) {
+        fallbackResults[index] = {
+          Result: readErr ? 1 : 0,
+          Data: readErr ? null : data,
+          Error: readErr ? client.ErrorText(readErr) : null,
         };
 
-        pending -= 1;// Décrémentation du compteur de lectures en attente
-        if (pending === 0) {// Si toutes les lectures sont terminées, on appelle le callback avec les résultats
-          callback(null, fallbackResults);// Appel du callback avec les résultats de lecture
+        pending -= 1;
+        if (pending === 0) {
+          callback(null, fallbackResults);
         }
       }
     );
@@ -118,8 +152,57 @@ function lireVariablesEnBloc(variables, callback) {
 }
 
 // ============================================================
-// FONCTION : Lecture des variables depuis le DB3 de l'automate
-// Les offsets correspondent exactement à ton DB_Mesures_Elec [DB3]
+// Seuils de détection d'anomalie (à ajuster selon ton installation)
+// ============================================================
+const seuils = {
+  tension:   { min: 200, max: 250 },   // exemple pour 230V nominal
+  courant:   { min: 10,  max: 32 },    // exemple pour disjoncteur 32A
+  puissance: { min: 5,   max: 7000 },  // exemple en W
+};
+
+// ============================================================
+// FONCTION : Vérifie si une mesure est anormale
+// ============================================================
+function estAnormale(mesure) {
+  const tensionsAnormales = [mesure.v1, mesure.v2, mesure.v3].some(
+    v => v < seuils.tension.min || v > seuils.tension.max
+  );
+
+  const courantsAnormaux = [mesure.i1, mesure.i2, mesure.i3].some(
+    i => i < seuils.courant.min || i > seuils.courant.max
+  );
+
+  const puissancesAnormales = [mesure.p1, mesure.p2, mesure.p3].some(
+    p => p < seuils.puissance.min || p > seuils.puissance.max
+  );
+
+  return tensionsAnormales || courantsAnormaux || puissancesAnormales;
+}
+
+// ============================================================
+// FONCTION : Envoie une notification push via Firebase Cloud Messaging
+// ============================================================
+async function envoyerNotificationPush(title, corps) {
+  if (tokensEnregistres.length === 0) {
+    console.log('⚠️ Aucun token enregistré pour les notifications push');
+    return;
+  }
+  const message = {
+    notification: { title: title, body: corps },
+    tokens: tokensEnregistres,
+  };
+  try {
+    const response = await getMessaging().sendEachForMulticast(message);
+    console.log(`✅ ${response.successCount} notification(s) envoyée(s)`);
+  } catch (error) {
+    console.log('❌ Erreur envoi push :', error);
+  }
+}
+
+// ============================================================
+// FONCTION : Lecture des données depuis l'automate
+// (Cette fonction lit les VRAIES valeurs de l'automate et les sauvegarde
+//  telles quelles si elles sont anormales — pas de valeurs fictives ici)
 // ============================================================
 function lireDonneesAutomate() {
   if (!client.Connected()) {
@@ -150,35 +233,48 @@ function lireDonneesAutomate() {
     { Area: client.S7AreaDB, WordLen: client.S7WLReal, DBNumber: 3, Start: 168, Amount: 1 }, // FC_PUISSANCE
   ];
 
-  // Lecture simultanée de toutes les variables depuis l'automate
   try {
-    lireVariablesEnBloc(variables, function(err, results) {
+    lireVariablesEnBloc(variables, function (err, results) {
       if (err) {
-        // Affichage de l'erreur si la lecture échoue
         console.error('❌ Erreur lecture variables :', client.ErrorText(err));
         return;
       }
 
-      // Construction de l'objet mesure avec les valeurs lues
+      // ✅ Construction de l'objet mesure avec les VRAIES valeurs lues depuis l'automate
       const mesure = {
-        date:         new Date().toISOString().slice(0, 16), // Date et heure actuelles au format 2025-06-29T08:00
-        i1:           lireValeurFloat(results[0]),  // Courant phase 1 (A)
-        i2:           lireValeurFloat(results[1]),  // Courant phase 2 (A)
-        i3:           lireValeurFloat(results[2]),  // Courant phase 3 (A)
-        v1:           lireValeurFloat(results[3]),  // Tension phase 1 (V)
-        v2:           lireValeurFloat(results[4]),  // Tension phase 2 (V)
-        v3:           lireValeurFloat(results[5]),  // Tension phase 3 (V)
-        p1:           lireValeurFloat(results[6])*1000,  // Puissance phase 1 (W)
-        p2:           lireValeurFloat(results[7])*1000,  // Puissance phase 2 (W)
-        p3:           lireValeurFloat(results[8])*1000,  // Puissance phase 3 (W)
-        p_totale:     lireValeurFloat(results[9])*1000,  // Puissance active totale (W)
-        fc_puissance: lireValeurFloat(results[10]), // Facteur de puissance
+        date:         new Date().toISOString().slice(0, 16),
+        i1:           lireValeurFloat(results[0]),
+        i2:           lireValeurFloat(results[1]),
+        i3:           lireValeurFloat(results[2]),
+        v1:           lireValeurFloat(results[3]),
+        v2:           lireValeurFloat(results[4]),
+        v3:           lireValeurFloat(results[5]),
+        p1:           lireValeurFloat(results[6]) * 1000,
+        p2:           lireValeurFloat(results[7]) * 1000,
+        p3:           lireValeurFloat(results[8]) * 1000,
+        p_totale:     lireValeurFloat(results[9]) * 1000,
+        fc_puissance: lireValeurFloat(results[10]),
       };
 
       console.log('📊 Mesure lue depuis DB3 :', mesure);
 
-      // Sauvegarde automatique de la mesure dans le fichier Excel
-      sauvegarderMesuresDansFichier([mesure]);
+      // Envoi en temps réel au frontend via WebSocket (toujours, même si normale)
+      io.emit('mesures', mesure);
+
+      // ✅ Sauvegarde dans le fichier Excel UNIQUEMENT si la mesure est anormale
+      //    → "mesure" contient les valeurs RÉELLEMENT lues depuis l'automate, pas des valeurs fictives
+      if (estAnormale(mesure)) {
+        console.log('🚨 Anomalie détectée — sauvegarde de la mesure');
+        sauvegarderMesuresDansFichier([mesure]);
+
+        io.emit('anomalie', mesure);
+        envoyerNotificationPush(
+          '⚠️ Anomalie détectée',
+          `Valeurs anormales détectées à ${new Date().toLocaleTimeString()}`
+        );
+      } else {
+        console.log('✅ Mesure normale — non sauvegardée');
+      }
     });
   } catch (error) {
     console.error('❌ Exception lors de la lecture des variables :', error.message);
@@ -190,62 +286,73 @@ function lireDonneesAutomate() {
 // Le fichier est dans public/ d'Angular pour être lu par le frontend
 // ============================================================
 function sauvegarderMesuresDansFichier(nouvellesMesures) {
-  let workbook; // Variable pour stocker le classeur Excel
-  let mesuresExistantes = []; // Variable pour stocker les mesures déjà enregistrées
+  let workbook;
+  let mesuresExistantes = [];
 
-  // Vérification si le fichier Excel existe déjà
   if (fs.existsSync(frontendExcelPath)) {
-    // Si oui → on lit les données existantes pour ne pas les écraser
     workbook = XLSX.readFile(frontendExcelPath);
-    const sheetName = workbook.SheetNames[0] || 'Mesures'; // Nom de la première feuille
-    const sheet = workbook.Sheets[sheetName]; // Récupération de la feuille
-    mesuresExistantes = sheet ? XLSX.utils.sheet_to_json(sheet, { defval: '' }) : []; // Conversion en JSON
+    const sheetName = workbook.SheetNames[0] || 'Mesures';
+    const sheet = workbook.Sheets[sheetName];
+    mesuresExistantes = sheet ? XLSX.utils.sheet_to_json(sheet, { defval: '' }) : [];
   } else {
-    // Si non → on crée un nouveau classeur Excel vide
     workbook = XLSX.utils.book_new();
   }
 
-  // Combinaison des mesures existantes avec les nouvelles mesures
   const toutesLesMesures = [...mesuresExistantes, ...nouvellesMesures];
-
-  // Conversion de toutes les mesures en une feuille Excel
   const worksheet = XLSX.utils.json_to_sheet(toutesLesMesures);
 
-  // Remplacement ou création de la feuille dans le classeur
   if (workbook.SheetNames && workbook.SheetNames.length > 0) {
-    // Si une feuille existe déjà → on la remplace
-    const sheetName = workbook.SheetNames[0];// Nom de la première feuille existante
-    workbook.Sheets[sheetName] = worksheet; // Remplacement de la feuille existante par la nouvelle feuille 
+    const sheetName = workbook.SheetNames[0];
+    workbook.Sheets[sheetName] = worksheet;
   } else {
-    // Sinon → on crée une nouvelle feuille appelée 'Mesures'
     XLSX.utils.book_append_sheet(workbook, worksheet, 'Mesures');
   }
 
-  // Création du répertoire si nécessaire (au cas où public/ n'existe pas)
   fs.mkdirSync(path.dirname(frontendExcelPath), { recursive: true });
-
-  // Écriture du classeur Excel dans le fichier
   XLSX.writeFile(workbook, frontendExcelPath);
   console.log('✅ Mesure sauvegardée dans Excel à :', new Date().toISOString().slice(0, 16));
 }
 
 // ============================================================
-// MIDDLEWARE : Configuration d'Express
+// ROUTE GET /api/test-anomalie : route de TEST temporaire
+// Permet de simuler une mesure anormale sans avoir besoin de l'automate
+// ⚠️ À retirer une fois les tests terminés
 // ============================================================
-app.use(cors()); // Autorise les requêtes depuis Angular (localhost:4200)
-app.use(express.json({ limit: '10mb' })); // Permet de lire le corps des requêtes JSON
+app.get('/api/test-anomalie', (req, res) => {
+  const mesureTest = {
+    date: new Date().toISOString().slice(0, 16),
+    i1: 0,   // en dehors du seuil 10-32 → déclenche l'anomalie
+    i2: 15,
+    i3: 15,
+    v1: 220, v2: 220, v3: 220,
+    p1: 1000, p2: 1000, p3: 1000,
+  };
+
+  console.log('📊 Mesure de test :', mesureTest);
+  io.emit('mesures', mesureTest);
+
+  if (estAnormale(mesureTest)) {
+    console.log('🚨 Anomalie détectée (test) — sauvegarde de la mesure');
+    sauvegarderMesuresDansFichier([mesureTest]);
+    io.emit('anomalie', mesureTest);
+    envoyerNotificationPush(
+      '⚠️ Anomalie détectée',
+      `Valeurs anormales détectées à ${new Date().toLocaleTimeString()}`
+    );
+  }
+
+  res.json({ success: true, mesure: mesureTest });
+});
 
 // ============================================================
 // ROUTE GET /api/mesures : Lecture temps réel depuis l'automate
 // Appelée par la page Mesures d'Angular pour afficher les valeurs actuelles
 // ============================================================
 app.get('/api/mesures', (req, res) => {
-  // Vérification que l'automate est bien connecté
   if (!client.Connected()) {
     return res.status(503).json({ message: '⚠️ Automate non connecté' });
   }
 
-  // Lecture des variables en temps réel depuis DB3d
   const variables = [
     { Area: client.S7AreaDB, WordLen: client.S7WLReal, DBNumber: 3, Start: 0,   Amount: 1 }, // I1
     { Area: client.S7AreaDB, WordLen: client.S7WLReal, DBNumber: 3, Start: 4,   Amount: 1 }, // I2
@@ -261,12 +368,11 @@ app.get('/api/mesures', (req, res) => {
   ];
 
   try {
-    lireVariablesEnBloc(variables, function(err, results) {
+    lireVariablesEnBloc(variables, function (err, results) {
       if (err) {
         return res.status(500).json({ error: client.ErrorText(err) });
       }
 
-      // Retourne les valeurs au format JSON pour Angular
       res.json({
         i1:           lireValeurFloat(results[0]),
         i2:           lireValeurFloat(results[1]),
@@ -274,10 +380,10 @@ app.get('/api/mesures', (req, res) => {
         v1:           lireValeurFloat(results[3]),
         v2:           lireValeurFloat(results[4]),
         v3:           lireValeurFloat(results[5]),
-        p1:           lireValeurFloat(results[6])*1000, // Conversion en W
-        p2:           lireValeurFloat(results[7])*1000, // Conversion en W
-        p3:           lireValeurFloat(results[8])*1000, // Conversion en W
-        p_totale:     lireValeurFloat(results[9])*1000, // Conversion en W
+        p1:           lireValeurFloat(results[6]) * 1000,
+        p2:           lireValeurFloat(results[7]) * 1000,
+        p3:           lireValeurFloat(results[8]) * 1000,
+        p_totale:     lireValeurFloat(results[9]) * 1000,
         fc_puissance: lireValeurFloat(results[10]),
       });
     });
@@ -292,17 +398,16 @@ app.get('/api/mesures', (req, res) => {
 // ============================================================
 app.get('/api/mesures/excel', (req, res) => {
   try {
-    // Vérification si le fichier Excel existe
     if (!fs.existsSync(frontendExcelPath)) {
-      return res.json([]); // Si le fichier n'existe pas, renvoyer un tableau vide
+      return res.json([]);
     }
 
-    const workbook = XLSX.readFile(frontendExcelPath); // Lecture du fichier Excel
-    const sheetName = workbook.SheetNames[0] || 'Mesures'; // Nom de la première feuille
-    const sheet = workbook.Sheets[sheetName]; // Récupération de la feuille
-    const mesures = sheet ? XLSX.utils.sheet_to_json(sheet, { defval: '' }) : []; // Conversion en JSON
+    const workbook = XLSX.readFile(frontendExcelPath);
+    const sheetName = workbook.SheetNames[0] || 'Mesures';
+    const sheet = workbook.Sheets[sheetName];
+    const mesures = sheet ? XLSX.utils.sheet_to_json(sheet, { defval: '' }) : [];
 
-    res.json(mesures); // Envoi des mesures au format JSON
+    res.json(mesures);
   } catch (error) {
     console.error('❌ Erreur lecture fichier Excel :', error);
     res.status(500).json({ message: 'Erreur lors de la lecture du fichier Excel' });
@@ -310,11 +415,29 @@ app.get('/api/mesures/excel', (req, res) => {
 });
 
 // ============================================================
+// ROUTE POST /api/mesures/excel : Sauvegarde manuelle dans le fichier Excel
+// Appelée par le bouton "Sauvegarder" côté Angular
+// ============================================================
+app.post('/api/mesures/excel', (req, res) => {
+  try {
+    const nouvellesMesures = Array.isArray(req.body) ? req.body : [req.body];
+    sauvegarderMesuresDansFichier(nouvellesMesures);
+    res.status(200).json({ message: '✅ Mesures sauvegardées avec succès' });
+  } catch (error) {
+    console.error('❌ Erreur lors de la sauvegarde manuelle :', error);
+    res.status(500).json({ message: 'Erreur lors de la sauvegarde' });
+  }
+});
+
+// ============================================================
 // DÉMARRAGE DU SERVEUR
+// ⚠️ On démarre "server" (et pas "app") car Socket.IO est attaché dessus
+// ⚠️ '0.0.0.0' est indispensable pour que l'émulateur/téléphone puisse accéder à l'API
 // ============================================================
 const PORT = 3000;
-app.listen(PORT, () => {
-  console.log(`✅ Serveur lancé sur http://localhost:${PORT}`);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`✅ Serveur lancé sur http://0.0.0.0:${PORT}`);
+  console.log(`📱 À utiliser depuis l'émulateur Android : http://10.0.2.2:${PORT}`);
 
   // Connexion à l'automate au démarrage du serveur
   connecterAutomate();
@@ -322,14 +445,12 @@ app.listen(PORT, () => {
   // ⏱️ Lecture et sauvegarde automatique toutes les 5 secondes
   setInterval(() => {
     if (client.Connected()) {
-      // Si l'automate est connecté → on lit les variables et on sauvegarde
       lireDonneesAutomate();
     } else {
-      // Si l'automate est déconnecté → on tente de se reconnecter
       console.log('⚠️ Automate déconnecté, tentative de reconnexion...');
       connecterAutomate();
     }
-  }, 5000); // 5000 ms = 5 secondes
+  }, 5000);
 });
 
 // ============================================================
@@ -338,13 +459,18 @@ app.listen(PORT, () => {
 // Automate S7-1214C (DB3)
 //         ↕ (node-snap7, toutes les 5s)
 // Backend Node.js (server.js)
-//         ├── Sauvegarde dans mesures.xlsx (public/)
-//         ├── GET /api/mesures       → page Mesures (temps réel)
-//         ├── GET /api/mesures/excel → page Historique (depuis Excel)
-//         └── POST /api/mesures/excel → sauvegarde manuelle
+//         ├── Socket.IO → événements 'mesures' et 'anomalie' en temps réel
+//         ├── Firebase Cloud Messaging → notifications push (même app fermée)
+//         ├── Sauvegarde dans mesures.xlsx (public/) UNIQUEMENT si anomalie détectée
+//         ├── GET  /api/status         → LED verte/rouge (état connexion automate)
+//         ├── GET  /api/mesures        → page Mesures (lecture temps réel via HTTP)
+//         ├── GET  /api/mesures/excel  → page Historique (depuis Excel)
+//         ├── POST /api/mesures/excel  → sauvegarde manuelle
+//         ├── POST /api/register-token → enregistre le token FCM d'un appareil
+//         └── GET  /api/test-anomalie  → route de TEST (à retirer après usage)
 //
 // Angular (my-app)
 //         ├── /login      → authentification
-//         ├── /mesures    → affichage temps réel via GET /api/mesures
+//         ├── /mesures    → affichage temps réel via Socket.IO + GET /api/mesures
 //         └── /historique → lecture Excel via GET /api/mesures/excel
 // ============================================================
